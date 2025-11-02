@@ -1,47 +1,71 @@
-﻿using System.Collections.Immutable;
+﻿// This code is NOT optimized (notably PCG32 algo)!
+// This is a demo.
+using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Threading.Tasks;
 
 namespace NaiveBruteforcer
 {
     internal class Program
     {
-        const uint RANGE_MAX = 2147483648;
+        const long RANGE_MAX = 2_147_483_648L;
 
         static void Main(string[] args)
         {
             var bytes = args.Select(s => byte.Parse(s)).ToImmutableArray();
-            var found = false;
+            var stopwatch = Stopwatch.StartNew();
 
-            var stopwatch = new Stopwatch();
-            stopwatch.Start();
+            var winnerSeed = -1L;
+            using var ctSource = new CancellationTokenSource();
 
-            var parallelLoopResult = Parallel.For(0, RANGE_MAX, (long seed, ParallelLoopState state) =>
+            var parallelOptions = new ParallelOptions
             {
-                if (found)
+                CancellationToken = ctSource.Token
+            };
+
+            var bytesLength = bytes.Length;
+            var partitioner = Partitioner.Create(0L, RANGE_MAX, 1_000_000L);
+
+            bool Found() => Interlocked.Read(ref winnerSeed) != -1L;
+            try
+            {
+                Parallel.ForEach(partitioner, parallelOptions, (range, state) =>
                 {
-                    state.Stop();
-                }
-
-                var rng = new PCG32((uint)seed);
-                for (var i = 0; i < bytes.Length; i++)
-                {
-                    if (rng.NextInt(0, 255) != bytes[i])
-                    {
+                    var token = parallelOptions.CancellationToken;
+                    if (Found() || token.IsCancellationRequested)
                         return;
-                    }
 
-                    if (i == bytes.Length - 1)
+                    const int checkStride = 16384; // power of 2, because we use bitwise AND shortcut
+                    for (var seed = range.Item1; seed < range.Item2; seed++)
                     {
-                        Console.WriteLine($"Found the seed '{seed}' in {stopwatch.ElapsedMilliseconds / 1000d:0.000} seconds.");
-                        found = true;
-                        state.Stop();
-                        return;
-                    }
-                }
-            });
+                        if ((seed & (checkStride - 1)) == 0 && (Found() || token.IsCancellationRequested))
+                            return;
 
-            if (!found)
+                        var rng = new PCG32((uint)seed);
+                        var i = 0;
+                        for (; i < bytesLength; i++)
+                        {
+                            if (rng.NextInt(0, 255) != bytes[i])
+                                break;
+                        }
+
+                        if (i == bytesLength)
+                        {
+                            if (Interlocked.CompareExchange(ref winnerSeed, seed, -1) == -1)
+                            {
+                                Console.WriteLine($"Found the seed '{seed}' in {stopwatch.ElapsedMilliseconds / 1000D:0.000} seconds.");
+                                ctSource.Cancel();
+                                state.Stop();
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+            catch (OperationCanceledException) { } // expected
+
+            stopwatch.Stop();
+            if (Interlocked.Read(ref winnerSeed) == -1)
             {
                 Console.WriteLine("No seed found for the given dataset!");
             }
